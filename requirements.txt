@@ -1,6 +1,17 @@
-python-dotenv
-pandas
-boto3
-requests
-python-docx
+# Core dependencies
+python-dotenv>=1.0.0
+pandas>=2.0.0
+boto3>=1.28.0
+requests>=2.31.0
+
+# Document generation
+python-docx>=0.8.11
+
+# Data analysis and visualization (auto-installed as needed)
+numpy>=1.24.0
+matplotlib>=3.7.0
+statsmodels>=0.14.0
+
+# Optional: Excel support
+openpyxl>=3.1.0
 

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, Callable, Tuple
 from .code_executor import CodeExecutor, PersistentCodeExecutor, SECURITY_LEVELS
 from .skill_loader import SkillLoader
+from .exceptions import retry_on_exception, ExecutionError
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -80,7 +81,89 @@ class ClaudeCodeAgent:
             )
 
         self.conversation_history = []
+        self._stats = {
+            'total_requests': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'total_code_blocks': 0,
+            'successful_executions': 0,
+            'failed_executions': 0,
+            'total_execution_time': 0.0,
+        }
         logger.info(f"ClaudeCodeAgent initialized with security_level={security_level}")
+
+    def _call_claude_with_retry(
+        self,
+        prompt: str,
+        max_tokens: int,
+        max_retries: int = 3,
+        initial_delay: float = 2.0
+    ) -> Optional[str]:
+        """
+        Call Claude API with automatic retry on failure.
+        
+        Args:
+            prompt: The prompt to send
+            max_tokens: Maximum tokens in response
+            max_retries: Number of retry attempts
+            initial_delay: Initial delay between retries (doubles each retry)
+            
+        Returns:
+            Response string or None if all retries failed
+        """
+        delay = initial_delay
+        last_error = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                self._stats['total_requests'] += 1
+                response = self.claude_client.invoke_llm_model(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=0.0
+                )
+                self._stats['successful_requests'] += 1
+                return response
+            except Exception as e:
+                last_error = e
+                self._stats['failed_requests'] += 1
+                
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Claude API call failed (attempt {attempt + 1}/{max_retries + 1}): {e}. "
+                        f"Retrying in {delay:.1f}s..."
+                    )
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff
+                else:
+                    logger.error(f"All {max_retries + 1} Claude API attempts failed: {e}")
+        
+        return None
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get execution statistics."""
+        stats = self._stats.copy()
+        if stats['total_requests'] > 0:
+            stats['success_rate'] = stats['successful_requests'] / stats['total_requests']
+        else:
+            stats['success_rate'] = 0.0
+        if stats['total_code_blocks'] > 0:
+            stats['execution_success_rate'] = stats['successful_executions'] / stats['total_code_blocks']
+        else:
+            stats['execution_success_rate'] = 0.0
+        return stats
+
+    def reset_stats(self):
+        """Reset execution statistics."""
+        self._stats = {
+            'total_requests': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'total_code_blocks': 0,
+            'successful_executions': 0,
+            'failed_executions': 0,
+            'total_execution_time': 0.0,
+        }
     
     def ask_and_execute(
         self,
@@ -106,21 +189,19 @@ class ClaudeCodeAgent:
         # Build comprehensive prompt
         full_prompt = self._build_prompt(prompt, skill_instructions, file_content)
         
-        # Get Claude's response
+        # Get Claude's response with retry logic
         logger.info("Sending request to Claude...")
-        try:
-            response = self.claude_client.invoke_llm_model(
-                prompt=full_prompt,
-                max_tokens=max_tokens,
-                temperature=0.0
-            )
-        except Exception as e:
-            logger.error(f"Error calling Claude API: {e}")
+        response = self._call_claude_with_retry(full_prompt, max_tokens)
+        
+        # Handle API failure
+        if response is None:
             return {
                 'success': False,
-                'error': str(e),
+                'error': 'Claude API call failed after all retries',
                 'response': None,
-                'executions': []
+                'executions': [],
+                'code_blocks': [],
+                'files': []
             }
         
         logger.info(f"Received response ({len(response)} chars)")
@@ -133,6 +214,7 @@ class ClaudeCodeAgent:
         
         # Extract code blocks
         code_blocks = self.executor.extract_python_blocks(response)
+        self._stats['total_code_blocks'] += len(code_blocks)
         
         result = {
             'success': True,
@@ -172,6 +254,12 @@ class ClaudeCodeAgent:
             all_files = set()
             for exec_result in execution_results:
                 all_files.update(exec_result.get('files', []))
+                # Update stats
+                if exec_result.get('success'):
+                    self._stats['successful_executions'] += 1
+                else:
+                    self._stats['failed_executions'] += 1
+                self._stats['total_execution_time'] += exec_result.get('execution_time', 0)
             result['files'] = list(all_files)
             
             # Log summary

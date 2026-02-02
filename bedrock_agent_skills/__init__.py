@@ -39,7 +39,7 @@ Security Levels:
 - 'permissive': Minimal restrictions (use with caution)
 """
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 __author__ = "Skills Team"
 
 # Exceptions and validators

@@ -181,6 +181,8 @@ class CodeExecutor:
     def extract_code_blocks(self, text: str) -> List[Dict[str, str]]:
         """
         Extract code blocks from text (markdown format).
+        
+        Handles nested code blocks properly.
 
         Args:
             text: Text containing code blocks
@@ -188,29 +190,88 @@ class CodeExecutor:
         Returns:
             List of dicts with 'language' and 'code' keys
         """
-        # Match code blocks with explicit language tags
-        markdown_pattern = r'```(\w+)?\n(.*?)```'
-        markdown_matches = re.findall(markdown_pattern, text, re.DOTALL)
-
+        code_blocks = []
+        
+        # Find all code block positions
+        lines = text.split('\n')
+        i = 0
+        
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            
+            # Check for code block start (```language or just ```)
+            start_match = re.match(r'^```(\w+)?$', stripped)
+            if start_match:
+                lang = start_match.group(1) if start_match.group(1) else None
+                block_start = i
+                code_lines = []
+                i += 1
+                
+                # For Python blocks, find the LAST matching ``` to handle nested content
+                if lang and lang.lower() in ['python', 'py', 'python3']:
+                    # Collect all lines until we find a valid closing
+                    # Try from the last ``` backward to find valid Python
+                    remaining_lines = lines[i:]
+                    
+                    # Find all potential closing positions (lines with just ```)
+                    close_positions = []
+                    for j, l in enumerate(remaining_lines):
+                        if l.strip() == '```':
+                            close_positions.append(j)
+                    
+                    # Try each closing position from last to first
+                    # to find the one that gives us valid Python
+                    found_valid = False
+                    for close_pos in reversed(close_positions):
+                        candidate_code = '\n'.join(remaining_lines[:close_pos])
+                        if self._is_valid_python(candidate_code):
+                            code_blocks.append({
+                                'language': lang.lower(),
+                                'code': candidate_code.strip()
+                            })
+                            i = block_start + close_pos + 2  # Move past this block
+                            found_valid = True
+                            break
+                    
+                    if not found_valid and close_positions:
+                        # Use the first closing as fallback
+                        code = '\n'.join(remaining_lines[:close_positions[0]])
+                        code_blocks.append({
+                            'language': lang.lower() if lang else 'unknown',
+                            'code': code.strip()
+                        })
+                        i = block_start + close_positions[0] + 2
+                    elif not close_positions:
+                        i += 1
+                else:
+                    # For non-Python blocks, use simple matching
+                    while i < len(lines):
+                        current = lines[i]
+                        if current.strip() == '```':
+                            break
+                        code_lines.append(current)
+                        i += 1
+                    i += 1  # Skip closing ```
+                    
+                    code = '\n'.join(code_lines)
+                    if lang:
+                        lang = lang.lower()
+                    elif self._looks_like_python(code):
+                        lang = 'python'
+                    else:
+                        lang = 'unknown'
+                    
+                    code_blocks.append({
+                        'language': lang,
+                        'code': code.strip()
+                    })
+            else:
+                i += 1
+        
+        # Also check for <run_code> format
         run_code_pattern = r'<run_code>\s*<language>(.*?)</language>\s*<code>(.*?)</code>\s*</run_code>'
         run_code_matches = re.findall(run_code_pattern, text, re.DOTALL)
-
-        code_blocks = []
-        for lang, code in markdown_matches:
-            # Only default to python if the block looks like Python code
-            if lang:
-                lang = lang.lower()
-            else:
-                # Check if it looks like Python code before defaulting
-                if self._looks_like_python(code):
-                    lang = 'python'
-                else:
-                    lang = 'unknown'
-
-            code_blocks.append({
-                'language': lang,
-                'code': code.strip()
-            })
 
         for lang, code in run_code_matches:
             lang = lang.strip().lower() if lang else 'python'
@@ -286,11 +347,12 @@ class CodeExecutor:
         Extract only valid Python code blocks.
 
         Filters out non-Python blocks and validates syntax.
+        Uses AST-based validation with detailed error reporting.
         """
         blocks = self.extract_code_blocks(text)
         python_blocks = []
 
-        for block in blocks:
+        for i, block in enumerate(blocks):
             lang = block['language']
             code = block['code']
 
@@ -300,7 +362,16 @@ class CodeExecutor:
                 if self._is_valid_python(code):
                     python_blocks.append(code)
                 else:
-                    logger.warning(f"Skipping invalid Python block: syntax error detected")
+                    # Get detailed error info
+                    error_details = self.get_syntax_error_details(code)
+                    if error_details:
+                        logger.warning(
+                            f"Skipping invalid Python block {i+1}: "
+                            f"Line {error_details['line']}: {error_details['message']}"
+                        )
+                        logger.debug(f"Problematic line: {error_details['text']}")
+                    else:
+                        logger.warning(f"Skipping invalid Python block {i+1}: syntax error detected")
             # Accept 'unknown' blocks that look like Python
             elif lang == 'unknown' and self._looks_like_python(code):
                 if self._is_valid_python(code):
@@ -316,19 +387,164 @@ class CodeExecutor:
         except SyntaxError as e:
             logger.debug(f"Syntax error in code: {e}")
             return False
+
+    def analyze_code(self, code: str) -> Dict[str, Any]:
+        """
+        Analyze Python code using AST to extract structural information.
+        
+        Args:
+            code: Python source code string
+            
+        Returns:
+            Dict containing:
+                - valid: bool - whether code is syntactically valid
+                - imports: list of imported modules
+                - from_imports: list of (module, names) tuples
+                - functions: list of function names defined
+                - classes: list of class names defined
+                - calls: list of function/method calls made
+                - file_operations: bool - whether code does file I/O
+                - has_network: bool - whether code might do network operations
+                - syntax_error: str or None - error message if invalid
+        """
+        import ast
+        
+        result = {
+            'valid': False,
+            'imports': [],
+            'from_imports': [],
+            'functions': [],
+            'classes': [],
+            'calls': [],
+            'file_operations': False,
+            'has_network': False,
+            'syntax_error': None,
+        }
+        
+        try:
+            tree = ast.parse(code)
+            result['valid'] = True
+        except SyntaxError as e:
+            result['syntax_error'] = f"Line {e.lineno}: {e.msg}"
+            return result
+        
+        # Walk the AST to extract information
+        for node in ast.walk(tree):
+            # Import statements: import x, import x.y
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    result['imports'].append(alias.name)
+                    
+            # From imports: from x import y
+            elif isinstance(node, ast.ImportFrom):
+                module = node.module or ''
+                names = [alias.name for alias in node.names]
+                result['from_imports'].append((module, names))
+                # Also track the base module
+                if module:
+                    result['imports'].append(module.split('.')[0])
+                    
+            # Function definitions
+            elif isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
+                result['functions'].append(node.name)
+                
+            # Class definitions
+            elif isinstance(node, ast.ClassDef):
+                result['classes'].append(node.name)
+                
+            # Function calls
+            elif isinstance(node, ast.Call):
+                call_name = self._get_call_name(node)
+                if call_name:
+                    result['calls'].append(call_name)
+                    
+                    # Check for file operations
+                    if call_name in ('open', 'read', 'write', 'Path.open', 
+                                    'Path.read_text', 'Path.write_text',
+                                    'Path.read_bytes', 'Path.write_bytes'):
+                        result['file_operations'] = True
+                        
+                    # Check for network operations
+                    if any(net in call_name for net in ('requests.', 'urllib.', 
+                                                         'http.', 'socket.', 
+                                                         'aiohttp.')):
+                        result['has_network'] = True
+        
+        # Remove duplicates while preserving order
+        result['imports'] = list(dict.fromkeys(result['imports']))
+        result['calls'] = list(dict.fromkeys(result['calls']))
+        
+        return result
     
+    def _get_call_name(self, node) -> Optional[str]:
+        """Extract the name of a function call from an AST Call node."""
+        import ast
+        
+        if isinstance(node.func, ast.Name):
+            return node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            # Handle chained attributes like obj.method or module.func
+            parts = []
+            current = node.func
+            while isinstance(current, ast.Attribute):
+                parts.append(current.attr)
+                current = current.value
+            if isinstance(current, ast.Name):
+                parts.append(current.id)
+            parts.reverse()
+            return '.'.join(parts)
+        return None
+
+    def get_syntax_error_details(self, code: str) -> Optional[Dict[str, Any]]:
+        """
+        Get detailed information about a syntax error in code.
+        
+        Args:
+            code: Python source code string
+            
+        Returns:
+            None if code is valid, otherwise dict with:
+                - line: line number (1-indexed)
+                - column: column offset
+                - message: error message
+                - text: the problematic line of code
+        """
+        try:
+            compile(code, '<string>', 'exec')
+            return None
+        except SyntaxError as e:
+            lines = code.split('\n')
+            problem_line = lines[e.lineno - 1] if e.lineno and e.lineno <= len(lines) else ''
+            return {
+                'line': e.lineno,
+                'column': e.offset,
+                'message': e.msg,
+                'text': problem_line,
+            }
+
     def check_imports(self, code: str) -> Tuple[bool, List[str]]:
         """
-        Check if code contains only allowed imports.
+        Check if code contains only allowed imports using AST analysis.
 
         Returns:
             (is_safe, list_of_issues)
         """
         issues = []
 
-        # Extract import statements
-        import_pattern = r'^\s*(?:import|from)\s+(\S+)'
-        imports = re.findall(import_pattern, code, re.MULTILINE)
+        # Use AST-based analysis for more accurate import detection
+        analysis = self.analyze_code(code)
+        
+        if not analysis['valid']:
+            # Fall back to regex for invalid code
+            import_pattern = r'^\s*(?:import|from)\s+(\S+)'
+            imports = re.findall(import_pattern, code, re.MULTILINE)
+        else:
+            # Use AST-extracted imports (more reliable)
+            imports = analysis['imports']
+            # Also check from_imports
+            for module, names in analysis['from_imports']:
+                if module:
+                    imports.append(module)
 
         # Check against blocked imports
         for imp in imports:
@@ -419,13 +635,54 @@ class CodeExecutor:
             'bs4': 'beautifulsoup4',
         }
         
+        # Comprehensive list of Python standard library modules
+        stdlib_modules = {
+            # Built-in and core modules
+            'os', 'sys', 'io', 'json', 're', 'time', 'datetime', 'math', 'random',
+            'collections', 'itertools', 'functools', 'operator', 'copy', 'pprint',
+            # File and path handling
+            'pathlib', 'shutil', 'glob', 'fnmatch', 'tempfile', 'fileinput',
+            # Data formats
+            'csv', 'configparser', 'xml', 'html', 'base64', 'binascii', 'struct',
+            # Text processing
+            'string', 'textwrap', 'difflib', 'unicodedata',
+            # Type hints and inspection
+            'typing', 'types', 'inspect', 'abc', 'dataclasses', 'enum',
+            # Concurrency
+            'threading', 'multiprocessing', 'subprocess', 'concurrent', 'asyncio',
+            'queue', 'sched',
+            # Networking and web
+            'socket', 'ssl', 'http', 'urllib', 'email', 'ftplib', 'smtplib',
+            # Compression and archiving
+            'zipfile', 'tarfile', 'gzip', 'bz2', 'lzma', 'zlib',
+            # Cryptography and hashing
+            'hashlib', 'hmac', 'secrets',
+            # Debugging and testing
+            'logging', 'warnings', 'traceback', 'pdb', 'unittest', 'doctest',
+            # System and runtime
+            'argparse', 'getopt', 'ctypes', 'platform', 'signal', 'atexit', 'gc',
+            # Encoding
+            'codecs', 'locale', 'gettext',
+            # Database
+            'sqlite3', 'dbm',
+            # Misc
+            'pickle', 'shelve', 'marshal', 'weakref', 'contextlib', 'decimal',
+            'fractions', 'statistics', 'cmath', 'heapq', 'bisect', 'array',
+            'calendar', 'uuid', 'dis', 'ast', 'symtable', 'token', 'keyword',
+            # Internal/private modules (should never be installed)
+            '_thread', '__future__', 'builtins',
+        }
+        
         packages = []
         for imp in imports:
             base_module = imp.split('.')[0]
             
-            # Skip standard library
-            if base_module in ['os', 'sys', 'json', 're', 'time', 'datetime', 
-                               'collections', 'itertools', 'functools', 'math']:
+            # Skip standard library modules
+            if base_module in stdlib_modules:
+                continue
+            
+            # Skip private/internal modules
+            if base_module.startswith('_'):
                 continue
             
             # Map to actual package name
