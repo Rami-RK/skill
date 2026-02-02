@@ -1,0 +1,6 @@
+python-dotenv
+pandas
+boto3
+requests
+python-docx
+
