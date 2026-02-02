@@ -42,6 +42,18 @@ Security Levels:
 __version__ = "1.0.0"
 __author__ = "Skills Team"
 
+# Exceptions and validators
+from .exceptions import (
+    BedrockSkillsError,
+    ConfigurationError,
+    ExecutionError,
+    SecurityError,
+    SkillError,
+    SkillNotFoundError,
+    SkillValidationError,
+    PackageInstallError,
+)
+
 # Core components
 from .code_executor import (
     CodeExecutor,
@@ -80,6 +92,14 @@ __all__ = [
     "CODE_GENERATION_GUIDELINES",
 
     # Exceptions
+    "BedrockSkillsError",
+    "ConfigurationError",
+    "ExecutionError",
+    "SecurityError",
+    "SkillError",
+    "SkillNotFoundError",
+    "SkillValidationError",
+    "PackageInstallError",
     "TimeoutException",
 
     # Version

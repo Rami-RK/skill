@@ -8,12 +8,21 @@ Supports multiple skill directory structures for flexibility.
 
 import os
 import json
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union
 import logging
 import hashlib
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from .exceptions import (
+    ConfigurationError,
+    SkillError,
+    SkillNotFoundError,
+    SkillValidationError,
+    validate_skills_directory,
+)
+
+# Use module-level logger (don't configure basicConfig - leave to caller)
 logger = logging.getLogger(__name__)
 
 # Default prompt additions for better code generation
@@ -45,17 +54,31 @@ class SkillLoader:
     """
     Loads skill instructions and all associated assets.
     Replicates the behavior of Anthropic's Skills API for Bedrock.
+
+    Thread-safe implementation with caching support.
     """
-    
+
     def __init__(self, skills_directory: str = "./custom_skills"):
         """
         Initialize skill loader.
-        
+
         Args:
             skills_directory: Base directory containing skill folders
+
+        Raises:
+            ConfigurationError: If skills_directory is invalid or doesn't exist
         """
+        # Validate but don't require it to exist (may be created later)
+        if not isinstance(skills_directory, (str, Path)):
+            raise ConfigurationError(
+                f"skills_directory must be a string or Path, got {type(skills_directory).__name__}"
+            )
+
         self.skills_directory = Path(skills_directory)
-        self.skill_cache = {}
+
+        # Thread-safe cache
+        self._lock = threading.RLock()
+        self.skill_cache: Dict[str, Dict[str, Any]] = {}
     
     def load_skill(self, skill_name: str, include_scripts: bool = False) -> Dict[str, Any]:
         """
@@ -76,16 +99,31 @@ class SkillLoader:
                 - scripts: Dict of script file contents (if include_scripts=True)
                 - assets: List of asset file paths
                 - metadata: Skill metadata
+
+        Raises:
+            SkillNotFoundError: If skill directory or SKILL.md not found
+            SkillError: If skill loading fails
         """
+        if not skill_name or not isinstance(skill_name, str):
+            raise SkillError("skill_name must be a non-empty string")
+
+        # Sanitize skill name (prevent path traversal)
+        skill_name = skill_name.strip().replace('..', '').replace('/', '').replace('\\', '')
+        if not skill_name:
+            raise SkillError("Invalid skill_name after sanitization")
+
         cache_key = f"{skill_name}_{include_scripts}"
-        if cache_key in self.skill_cache:
-            logger.info(f"Using cached skill: {skill_name}")
-            return self.skill_cache[cache_key]
+
+        # Thread-safe cache check
+        with self._lock:
+            if cache_key in self.skill_cache:
+                logger.debug(f"Using cached skill: {skill_name}")
+                return self.skill_cache[cache_key]
 
         skill_path = self.skills_directory / skill_name
 
         if not skill_path.exists():
-            raise FileNotFoundError(f"Skill directory not found: {skill_path}")
+            raise SkillNotFoundError(f"Skill directory not found: {skill_path}")
 
         skill_data = {
             'name': skill_name,
@@ -101,7 +139,7 @@ class SkillLoader:
         # Load main SKILL.md
         skill_md = skill_path / "SKILL.md"
         if not skill_md.exists():
-            raise FileNotFoundError(f"SKILL.md not found in {skill_path}")
+            raise SkillNotFoundError(f"SKILL.md not found in {skill_path}")
 
         with open(skill_md, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -128,14 +166,32 @@ class SkillLoader:
         # Load asset files
         self._load_assets(skill_path, skill_data)
 
-        # Cache the skill
-        self.skill_cache[cache_key] = skill_data
+        # Thread-safe cache update
+        with self._lock:
+            self.skill_cache[cache_key] = skill_data
 
         logger.info(f"Loaded skill '{skill_name}': {len(skill_data['references'])} refs, "
                    f"{len([s for s in skill_data['scripts'].values() if s is not None])} scripts loaded, "
                    f"{len(skill_data['assets'])} assets")
 
         return skill_data
+
+    def clear_cache(self, skill_name: Optional[str] = None):
+        """
+        Clear skill cache.
+
+        Args:
+            skill_name: Specific skill to clear, or None to clear all
+        """
+        with self._lock:
+            if skill_name:
+                keys_to_remove = [k for k in self.skill_cache if k.startswith(f"{skill_name}_")]
+                for key in keys_to_remove:
+                    del self.skill_cache[key]
+                logger.debug(f"Cleared cache for skill: {skill_name}")
+            else:
+                self.skill_cache.clear()
+                logger.debug("Cleared all skill cache")
 
     def _load_references(self, skill_path: Path, skill_data: Dict) -> None:
         """Load reference files from both flat and nested structures."""

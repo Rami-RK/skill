@@ -13,6 +13,8 @@ import shutil
 import json
 import time
 import re
+import atexit
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union
 import logging
@@ -21,7 +23,20 @@ import signal
 import traceback
 import hashlib
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from .exceptions import (
+    ConfigurationError,
+    ExecutionError,
+    SecurityError,
+    PackageInstallError,
+    validate_security_level,
+    validate_timeout,
+    validate_encoding,
+    validate_workspace_dir,
+    validate_max_memory,
+    retry_on_exception,
+)
+
+# Use module-level logger (don't configure basicConfig - leave to caller)
 logger = logging.getLogger(__name__)
 
 # Default safe imports for data science / ML workflows
@@ -52,6 +67,25 @@ SECURITY_LEVELS = {
         'blocked_patterns': [],
     }
 }
+
+# Track active executors for cleanup
+_active_executors: List['CodeExecutor'] = []
+_cleanup_lock = threading.Lock()
+
+
+def _cleanup_all_executors():
+    """Cleanup function registered with atexit."""
+    with _cleanup_lock:
+        for executor in _active_executors[:]:  # Copy list to avoid mutation during iteration
+            try:
+                if hasattr(executor, '_temp_workspace') and executor._temp_workspace:
+                    executor.cleanup()
+            except Exception as e:
+                logger.debug(f"Error during cleanup: {e}")
+
+
+# Register cleanup on interpreter exit
+atexit.register(_cleanup_all_executors)
 
 
 class TimeoutException(Exception):
@@ -89,39 +123,60 @@ class CodeExecutor:
 
         Args:
             workspace_dir: Directory for code execution (created if doesn't exist)
-            timeout: Maximum execution time in seconds
-            max_memory_mb: Maximum memory usage in MB
+            timeout: Maximum execution time in seconds (1-3600)
+            max_memory_mb: Maximum memory usage in MB (1-65536)
             allowed_imports: Whitelist of allowed imports (None = allow all safe imports)
             blocked_imports: Blacklist of blocked imports (overrides security_level)
             auto_install_packages: Auto-install missing packages
             security_level: 'strict', 'moderate', or 'permissive' (default: 'moderate')
             accumulate_blocks: Execute blocks with accumulated context (default: True)
             encoding: File encoding for code files (default: 'utf-8')
+
+        Raises:
+            ConfigurationError: If any parameter is invalid
         """
-        self.workspace_dir = str(Path(workspace_dir).resolve()) if workspace_dir else tempfile.mkdtemp(prefix="code_exec_")
-        self.timeout = timeout
-        self.max_memory_mb = max_memory_mb
-        self.auto_install_packages = auto_install_packages
-        self.security_level = security_level
-        self.accumulate_blocks = accumulate_blocks
-        self.encoding = encoding
+        # Validate all inputs
+        self.security_level = validate_security_level(security_level)
+        self.timeout = validate_timeout(timeout)
+        self.max_memory_mb = validate_max_memory(max_memory_mb)
+        self.encoding = validate_encoding(encoding)
+
+        # Set up workspace
+        validated_workspace = validate_workspace_dir(workspace_dir)
+        if validated_workspace:
+            self.workspace_dir = validated_workspace
+            self._temp_workspace = False
+        else:
+            self.workspace_dir = tempfile.mkdtemp(prefix="code_exec_")
+            self._temp_workspace = True
+
+        self.auto_install_packages = bool(auto_install_packages)
+        self.accumulate_blocks = bool(accumulate_blocks)
 
         # Set up security based on level
-        security_config = SECURITY_LEVELS.get(security_level, SECURITY_LEVELS['moderate'])
-        self.blocked_imports = blocked_imports if blocked_imports is not None else security_config['blocked_imports']
-        self.blocked_patterns = security_config['blocked_patterns']
-        self.allowed_imports = allowed_imports if allowed_imports is not None else DEFAULT_SAFE_IMPORTS
+        security_config = SECURITY_LEVELS[self.security_level]
+        self.blocked_imports = list(blocked_imports) if blocked_imports is not None else list(security_config['blocked_imports'])
+        self.blocked_patterns = list(security_config['blocked_patterns'])
+        self.allowed_imports = list(allowed_imports) if allowed_imports is not None else list(DEFAULT_SAFE_IMPORTS)
 
         # Create workspace
         Path(self.workspace_dir).mkdir(parents=True, exist_ok=True)
 
-        # Track installed packages and accumulated code
-        self.installed_packages = set()
-        self.accumulated_code = []
-        self.accumulated_imports = set()
+        # Thread-safe tracking of installed packages and accumulated code
+        self._lock = threading.RLock()
+        self.installed_packages: set = set()
+        self.accumulated_code: List[str] = []
+        self.accumulated_imports: set = set()
+
+        # Track for cleanup
+        with _cleanup_lock:
+            _active_executors.append(self)
+
+        # State tracking
+        self._is_cleaned_up = False
 
         logger.info(f"Code executor initialized with workspace: {self.workspace_dir}")
-        logger.info(f"Security level: {security_level}, Accumulate blocks: {accumulate_blocks}")
+        logger.debug(f"Security level: {self.security_level}, Accumulate blocks: {self.accumulate_blocks}")
     
     def extract_code_blocks(self, text: str) -> List[Dict[str, str]]:
         """
@@ -379,43 +434,72 @@ class CodeExecutor:
         
         return list(set(packages))
     
-    def install_package(self, package: str) -> bool:
+    def install_package(self, package: str, max_retries: int = 2) -> bool:
         """
-        Install a Python package using pip.
-        
+        Install a Python package using pip with retry logic.
+
         Args:
             package: Package name to install
-            
+            max_retries: Maximum number of retry attempts (default: 2)
+
         Returns:
             True if successful, False otherwise
         """
-        if package in self.installed_packages:
-            logger.info(f"Package '{package}' already installed")
-            return True
-        
-        try:
-            logger.info(f"Installing package: {package}")
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", package, "--break-system-packages"],
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
-            
-            if result.returncode == 0:
-                self.installed_packages.add(package)
-                logger.info(f"Successfully installed: {package}")
+        if not package or not isinstance(package, str):
+            logger.warning(f"Invalid package name: {package}")
+            return False
+
+        # Sanitize package name
+        package = package.strip()
+        if not package:
+            return False
+
+        with self._lock:
+            if package in self.installed_packages:
+                logger.debug(f"Package '{package}' already installed (cached)")
                 return True
-            else:
-                logger.error(f"Failed to install {package}: {result.stderr}")
-                return False
-                
-        except subprocess.TimeoutExpired:
-            logger.error(f"Installation of {package} timed out")
-            return False
-        except Exception as e:
-            logger.error(f"Error installing {package}: {e}")
-            return False
+
+        # Retry loop
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                logger.info(f"Installing package: {package} (attempt {attempt + 1}/{max_retries + 1})")
+
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", package, "-q", "--break-system-packages"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+
+                if result.returncode == 0:
+                    with self._lock:
+                        self.installed_packages.add(package)
+                    logger.info(f"Successfully installed: {package}")
+                    return True
+                else:
+                    last_error = result.stderr.strip() if result.stderr else "Unknown error"
+                    logger.warning(f"Attempt {attempt + 1} failed for {package}: {last_error[:100]}")
+
+                    if attempt < max_retries:
+                        time.sleep(1.0 * (attempt + 1))  # Exponential backoff
+
+            except subprocess.TimeoutExpired:
+                last_error = "Installation timed out"
+                logger.warning(f"Attempt {attempt + 1} timed out for {package}")
+                if attempt < max_retries:
+                    time.sleep(2.0)
+
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"Attempt {attempt + 1} error for {package}: {e}")
+                if attempt < max_retries:
+                    time.sleep(1.0)
+
+        logger.error(f"Failed to install {package} after {max_retries + 1} attempts: {last_error}")
+        return False
     
     def prepare_execution_environment(self, code: str) -> Tuple[bool, str]:
         """
@@ -624,9 +708,10 @@ class CodeExecutor:
         return '\n'.join(parts)
 
     def reset_accumulated(self):
-        """Reset accumulated code context."""
-        self.accumulated_code = []
-        self.accumulated_imports = set()
+        """Reset accumulated code context (thread-safe)."""
+        with self._lock:
+            self.accumulated_code = []
+            self.accumulated_imports = set()
         logger.info("Accumulated code context reset")
     
     def execute_code_blocks(
@@ -711,12 +796,34 @@ class CodeExecutor:
             return file_path.read_bytes()
         return None
     
-    def cleanup(self):
-        """Clean up workspace directory."""
-        if os.path.exists(self.workspace_dir):
-            shutil.rmtree(self.workspace_dir)
-            logger.info(f"Cleaned up workspace: {self.workspace_dir}")
-    
+    def cleanup(self) -> bool:
+        """
+        Clean up workspace directory.
+
+        Returns:
+            True if cleanup was performed, False if already cleaned up
+        """
+        with self._lock:
+            if self._is_cleaned_up:
+                logger.debug(f"Workspace already cleaned up: {self.workspace_dir}")
+                return False
+
+            if self._temp_workspace and os.path.exists(self.workspace_dir):
+                try:
+                    shutil.rmtree(self.workspace_dir)
+                    logger.info(f"Cleaned up workspace: {self.workspace_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup workspace: {e}")
+
+            self._is_cleaned_up = True
+
+            # Remove from active executors
+            with _cleanup_lock:
+                if self in _active_executors:
+                    _active_executors.remove(self)
+
+            return True
+
     @contextmanager
     def session(self):
         """Context manager for automatic cleanup."""
@@ -724,6 +831,24 @@ class CodeExecutor:
             yield self
         finally:
             self.cleanup()
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit with cleanup."""
+        self.cleanup()
+        return False  # Don't suppress exceptions
+
+    def __del__(self):
+        """Destructor - attempt cleanup if not already done."""
+        try:
+            if hasattr(self, '_is_cleaned_up') and not self._is_cleaned_up:
+                if hasattr(self, '_temp_workspace') and self._temp_workspace:
+                    self.cleanup()
+        except Exception:
+            pass  # Ignore errors during garbage collection
 
 
 class PersistentCodeExecutor(CodeExecutor):
