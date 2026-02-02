@@ -126,13 +126,14 @@ class CodeExecutor:
     def extract_code_blocks(self, text: str) -> List[Dict[str, str]]:
         """
         Extract code blocks from text (markdown format).
-        
+
         Args:
             text: Text containing code blocks
-            
+
         Returns:
             List of dicts with 'language' and 'code' keys
         """
+        # Match code blocks with explicit language tags
         markdown_pattern = r'```(\w+)?\n(.*?)```'
         markdown_matches = re.findall(markdown_pattern, text, re.DOTALL)
 
@@ -141,7 +142,16 @@ class CodeExecutor:
 
         code_blocks = []
         for lang, code in markdown_matches:
-            lang = lang.lower() if lang else 'python'
+            # Only default to python if the block looks like Python code
+            if lang:
+                lang = lang.lower()
+            else:
+                # Check if it looks like Python code before defaulting
+                if self._looks_like_python(code):
+                    lang = 'python'
+                else:
+                    lang = 'unknown'
+
             code_blocks.append({
                 'language': lang,
                 'code': code.strip()
@@ -153,13 +163,104 @@ class CodeExecutor:
                 'language': lang,
                 'code': code.strip()
             })
-        
+
         return code_blocks
-    
+
+    def _looks_like_python(self, code: str) -> bool:
+        """
+        Heuristic check if code looks like Python.
+
+        Args:
+            code: Code string to check
+
+        Returns:
+            True if the code appears to be Python
+        """
+        code = code.strip()
+        if not code:
+            return False
+
+        # Patterns that indicate Python code
+        python_indicators = [
+            r'^\s*import\s+\w+',           # import statement
+            r'^\s*from\s+\w+\s+import',    # from X import Y
+            r'^\s*def\s+\w+\s*\(',         # function definition
+            r'^\s*class\s+\w+',            # class definition
+            r'^\s*if\s+.*:',               # if statement
+            r'^\s*for\s+\w+\s+in\s+',      # for loop
+            r'^\s*while\s+.*:',            # while loop
+            r'^\s*print\s*\(',             # print function
+            r'^\s*#.*$',                   # Python comment at start
+            r'^\s*\w+\s*=\s*',             # assignment
+            r'^\s*@\w+',                   # decorator
+            r'^\s*try\s*:',                # try block
+            r'^\s*with\s+.*:',             # with statement
+        ]
+
+        # Check first few non-empty lines
+        lines = [l for l in code.split('\n') if l.strip()][:5]
+        first_content = '\n'.join(lines)
+
+        for pattern in python_indicators:
+            if re.search(pattern, first_content, re.MULTILINE):
+                return True
+
+        # Patterns that indicate NOT Python (markdown, etc.)
+        non_python_patterns = [
+            r'^\*\*\w+.*\*\*',              # Bold markdown **text**
+            r'^#{1,6}\s+\w+',               # Markdown headers
+            r'^\s*-\s+\w+',                 # Markdown list items
+            r'^\s*\d+\.\s+\w+',             # Numbered list items
+            r'^>\s+',                        # Blockquote
+            r'\[.*\]\(.*\)',                 # Markdown links
+        ]
+
+        for pattern in non_python_patterns:
+            if re.search(pattern, first_content, re.MULTILINE):
+                return False
+
+        # If we can't determine, check for valid Python syntax
+        try:
+            compile(code, '<string>', 'exec')
+            return True
+        except SyntaxError:
+            return False
+
     def extract_python_blocks(self, text: str) -> List[str]:
-        """Extract only Python code blocks."""
+        """
+        Extract only valid Python code blocks.
+
+        Filters out non-Python blocks and validates syntax.
+        """
         blocks = self.extract_code_blocks(text)
-        return [block['code'] for block in blocks if block['language'] == 'python']
+        python_blocks = []
+
+        for block in blocks:
+            lang = block['language']
+            code = block['code']
+
+            # Accept explicitly marked Python blocks
+            if lang in ['python', 'py', 'python3']:
+                # Validate it's actually valid Python
+                if self._is_valid_python(code):
+                    python_blocks.append(code)
+                else:
+                    logger.warning(f"Skipping invalid Python block: syntax error detected")
+            # Accept 'unknown' blocks that look like Python
+            elif lang == 'unknown' and self._looks_like_python(code):
+                if self._is_valid_python(code):
+                    python_blocks.append(code)
+
+        return python_blocks
+
+    def _is_valid_python(self, code: str) -> bool:
+        """Check if code has valid Python syntax."""
+        try:
+            compile(code, '<string>', 'exec')
+            return True
+        except SyntaxError as e:
+            logger.debug(f"Syntax error in code: {e}")
+            return False
     
     def check_imports(self, code: str) -> Tuple[bool, List[str]]:
         """
