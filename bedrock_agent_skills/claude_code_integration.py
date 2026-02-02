@@ -1,13 +1,16 @@
 """
 Integration module connecting Claude API with Code Executor.
 Provides automated workflow for LLM-generated code execution.
+
+Production-grade module for AWS Bedrock Claude skill execution.
 """
 
 import json
 import logging
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Any
-from .code_executor import CodeExecutor, PersistentCodeExecutor
+from typing import Dict, List, Optional, Any, Union, Callable, Tuple
+from .code_executor import CodeExecutor, PersistentCodeExecutor, SECURITY_LEVELS
 from .skill_loader import SkillLoader
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,8 +21,10 @@ class ClaudeCodeAgent:
     """
     Agent that combines Claude API with code execution capabilities.
     Automatically extracts and executes code from Claude's responses.
+
+    Production-grade agent for AWS Bedrock Claude skill workflows.
     """
-    
+
     def __init__(
         self,
         claude_client,
@@ -27,36 +32,55 @@ class ClaudeCodeAgent:
         auto_execute: bool = True,
         require_confirmation: bool = True,
         persistent: bool = False,
+        security_level: str = 'moderate',
+        accumulate_blocks: bool = True,
+        encoding: str = 'utf-8',
+        timeout: int = 300,
         **executor_kwargs
     ):
         """
         Initialize Claude Code Agent.
-        
+
         Args:
             claude_client: Instance of ClaudeAPI or ClaudeAPIS35
             workspace_dir: Directory for code execution
             auto_execute: Automatically execute code from responses
             require_confirmation: Ask for confirmation before execution
             persistent: Use persistent workspace
+            security_level: 'strict', 'moderate', or 'permissive' (default: 'moderate')
+            accumulate_blocks: Execute blocks with accumulated context (default: True)
+            encoding: File encoding (default: 'utf-8')
+            timeout: Execution timeout in seconds (default: 300)
             **executor_kwargs: Additional arguments for CodeExecutor
         """
         self.claude_client = claude_client
         self.auto_execute = auto_execute
         self.require_confirmation = require_confirmation
-        
+        self.security_level = security_level
+
+        # Prepare executor kwargs
+        exec_kwargs = {
+            'security_level': security_level,
+            'accumulate_blocks': accumulate_blocks,
+            'encoding': encoding,
+            'timeout': timeout,
+            **executor_kwargs
+        }
+
         # Initialize executor
         if persistent:
             self.executor = PersistentCodeExecutor(
                 workspace_dir=workspace_dir or "./claude_workspace",
-                **executor_kwargs
+                **exec_kwargs
             )
         else:
             self.executor = CodeExecutor(
                 workspace_dir=workspace_dir,
-                **executor_kwargs
+                **exec_kwargs
             )
-        
+
         self.conversation_history = []
+        logger.info(f"ClaudeCodeAgent initialized with security_level={security_level}")
     
     def ask_and_execute(
         self,
@@ -259,24 +283,30 @@ class SkillBasedAgent(ClaudeCodeAgent):
     """
     Agent specialized for skill-based workflows.
     Automatically loads and applies skill instructions with all assets.
+
+    Production-grade agent for AWS Bedrock Claude skill workflows.
     """
-    
+
     def __init__(
         self,
         claude_client,
         skills_directory: str = "./custom_skills",
+        include_code_guidelines: bool = True,
         **kwargs
     ):
         """
         Initialize skill-based agent.
-        
+
         Args:
             claude_client: Instance of ClaudeAPI or ClaudeAPIS35
             skills_directory: Directory containing skill folders
+            include_code_guidelines: Include code generation guidelines in prompts
             **kwargs: Additional arguments for ClaudeCodeAgent
         """
         super().__init__(claude_client, **kwargs)
         self.skill_loader = SkillLoader(skills_directory)
+        self.include_code_guidelines = include_code_guidelines
+        self.skills_directory = skills_directory
     
     def load_skill(self, skill_name: str, include_scripts: bool = False) -> Dict[str, any]:
         """
@@ -296,46 +326,63 @@ class SkillBasedAgent(ClaudeCodeAgent):
         skill_name: str,
         prompt: str,
         file_path: Optional[str] = None,
+        file_content: Optional[str] = None,
         include_references: bool = True,
         include_scripts: bool = False,
+        include_assets: bool = True,
+        check_safety: bool = True,
+        stop_on_error: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         """
         Execute a task using a specific skill with all its assets.
-        
+
         Args:
             skill_name: Name of skill to use
             prompt: User prompt
             file_path: Optional path to input file
+            file_content: Optional file content (alternative to file_path)
             include_references: Include skill reference files
             include_scripts: Include skill scripts
+            include_assets: Include skill asset contents
+            check_safety: Perform safety checks on code
+            stop_on_error: Stop execution if a code block fails
             **kwargs: Additional arguments for ask_and_execute
-            
+
         Returns:
-            Execution result
+            Execution result with keys: success, response, code_blocks, executions, files
         """
-        # Load file content if provided
-        file_content = None
-        if file_path:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                file_content = f.read()
-        
+        start_time = time.time()
+
+        # Load file content if file_path provided
+        if file_path and not file_content:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    file_content = f.read()
+            except UnicodeDecodeError:
+                # Try with latin-1 as fallback
+                with open(file_path, 'r', encoding='latin-1') as f:
+                    file_content = f.read()
+
         # Build comprehensive prompt with skill loader
         full_prompt = self.skill_loader.build_comprehensive_prompt(
             skill_name=skill_name,
             user_query=prompt,
             file_content=file_content,
             include_references=include_references,
-            include_scripts=include_scripts
+            include_scripts=include_scripts,
+            include_assets=include_assets,
+            include_code_guidelines=self.include_code_guidelines,
+            workspace_dir=self.executor.workspace_dir
         )
-        
+
         # Get Claude's response
         logger.info("Sending request to Claude with skill instructions...")
         try:
             response = self.claude_client.invoke_llm_model(
                 prompt=full_prompt,
                 max_tokens=kwargs.get('max_tokens', 4096),
-                temperature=0.0
+                temperature=kwargs.get('temperature', 0.0)
             )
         except Exception as e:
             logger.error(f"Error calling Claude API: {e}")
@@ -343,35 +390,41 @@ class SkillBasedAgent(ClaudeCodeAgent):
                 'success': False,
                 'error': str(e),
                 'response': None,
-                'executions': []
+                'code_blocks': [],
+                'executions': [],
+                'files': [],
+                'elapsed_time': time.time() - start_time
             }
-        
+
         logger.info(f"Received response ({len(response)} chars)")
-        
+
         # Store in history
         self.conversation_history.append({
             'skill': skill_name,
             'prompt': prompt,
-            'response': response
+            'response': response,
+            'timestamp': time.time()
         })
-        
+
         # Extract code blocks
         code_blocks = self.executor.extract_python_blocks(response)
-        
+
         result = {
             'success': True,
             'response': response,
             'code_blocks': code_blocks,
             'executions': [],
-            'files': []
+            'files': [],
+            'skill': skill_name,
+            'elapsed_time': 0
         }
-        
+
         # Execute code if requested
         should_execute = kwargs.get('execute', self.auto_execute)
-        
+
         if should_execute and code_blocks:
             logger.info(f"Found {len(code_blocks)} code blocks")
-            
+
             if self.require_confirmation:
                 print("\n" + "=" * 60)
                 print("CODE FOUND IN RESPONSE")
@@ -379,38 +432,97 @@ class SkillBasedAgent(ClaudeCodeAgent):
                 for i, code in enumerate(code_blocks, 1):
                     print(f"\nBlock {i}:")
                     print("-" * 40)
-                    print(code[:200] + ("..." if len(code) > 200 else ""))
+                    print(code[:300] + ("..." if len(code) > 300 else ""))
                 print("\n" + "=" * 60)
-                
+
                 user_response = input("Execute this code? (y/n): ").lower()
                 if user_response != 'y':
                     logger.info("Execution cancelled by user")
+                    result['elapsed_time'] = time.time() - start_time
                     return result
-            
-            # Execute all blocks
+
+            # Execute all blocks with the configured safety level
             logger.info("Executing code blocks...")
-            execution_results = self.executor.execute_code_blocks(response)
+            execution_results = self.executor.execute_code_blocks(
+                response,
+                check_safety=check_safety,
+                stop_on_error=stop_on_error
+            )
             result['executions'] = execution_results
-            
+
             # Collect all generated files
             all_files = set()
             for exec_result in execution_results:
                 all_files.update(exec_result.get('files', []))
             result['files'] = list(all_files)
-            
+
             # Log summary
             successful = sum(1 for r in execution_results if r['success'])
             logger.info(f"Execution complete: {successful}/{len(execution_results)} successful")
-        
+
+            # Update overall success status
+            if execution_results and not any(r['success'] for r in execution_results):
+                result['success'] = False
+
+        result['elapsed_time'] = time.time() - start_time
         return result
     
     def list_skills(self) -> List[str]:
         """List available skills."""
         return self.skill_loader.list_skills()
-    
-    def get_skill_info(self, skill_name: str) -> Dict[str, any]:
+
+    def get_skill_info(self, skill_name: str) -> Dict[str, Any]:
         """Get detailed information about a skill."""
         return self.skill_loader.get_skill_info(skill_name)
+
+    def validate_skill(self, skill_name: str) -> Tuple[bool, List[str]]:
+        """
+        Validate a skill's structure and configuration.
+
+        Args:
+            skill_name: Name of skill to validate
+
+        Returns:
+            (is_valid, list_of_issues)
+        """
+        return self.skill_loader.validate_skill(skill_name)
+
+    def get_execution_summary(self) -> Dict[str, Any]:
+        """
+        Get a summary of all executions in the current session.
+
+        Returns:
+            Dict with execution statistics
+        """
+        total_executions = 0
+        successful_executions = 0
+        failed_executions = 0
+        total_files = set()
+
+        for entry in self.conversation_history:
+            if 'executions' in entry:
+                for exec_result in entry.get('executions', []):
+                    total_executions += 1
+                    if exec_result.get('success'):
+                        successful_executions += 1
+                    else:
+                        failed_executions += 1
+                    total_files.update(exec_result.get('files', []))
+
+        return {
+            'total_conversations': len(self.conversation_history),
+            'total_executions': total_executions,
+            'successful_executions': successful_executions,
+            'failed_executions': failed_executions,
+            'total_files_generated': len(total_files),
+            'files': list(total_files)
+        }
+
+    def reset_session(self):
+        """Reset the agent session, clearing history and accumulated code."""
+        self.conversation_history = []
+        self.executor.reset_accumulated()
+        logger.info("Session reset complete")
 
 
 # Example usage

@@ -1,6 +1,8 @@
 """
 Secure Code Execution Framework for Local Automation
 Provides sandboxed Python code execution with safety measures.
+
+Production-grade module for AWS Bedrock Claude skill execution.
 """
 
 import os
@@ -12,14 +14,44 @@ import json
 import time
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 import logging
 from contextlib import contextmanager
 import signal
 import traceback
+import hashlib
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Default safe imports for data science / ML workflows
+DEFAULT_SAFE_IMPORTS = [
+    'pandas', 'numpy', 'matplotlib', 'seaborn', 'plotly',
+    'sklearn', 'scipy', 'statsmodels', 'prophet',
+    'json', 'csv', 'datetime', 'time', 'math', 'random',
+    'pathlib', 'os', 'sys', 're', 'collections', 'itertools', 'functools',
+    'typing', 'dataclasses', 'enum', 'abc',
+    'warnings', 'logging', 'io', 'base64', 'hashlib',
+    'docx', 'openpyxl', 'xlrd', 'PIL', 'cv2',
+    'requests', 'urllib', 'bs4',
+    'tqdm', 'rich', 'tabulate',
+]
+
+# Security levels for different use cases
+SECURITY_LEVELS = {
+    'strict': {
+        'blocked_imports': ['subprocess', 'os.system', 'eval', 'exec', 'compile', '__import__', 'ctypes', 'socket'],
+        'blocked_patterns': [r'\beval\s*\(', r'\bexec\s*\(', r'\bcompile\s*\(', r'\b__import__\s*\(', r'os\.system\s*\('],
+    },
+    'moderate': {
+        'blocked_imports': ['ctypes', 'socket'],
+        'blocked_patterns': [r'\beval\s*\(', r'\bexec\s*\('],
+    },
+    'permissive': {
+        'blocked_imports': [],
+        'blocked_patterns': [],
+    }
+}
 
 
 class TimeoutException(Exception):
@@ -36,8 +68,10 @@ class CodeExecutor:
     """
     Secure code executor with sandboxing and resource limits.
     Supports Python code execution with output capture and file management.
+
+    Production-grade executor for AWS Bedrock Claude skill workflows.
     """
-    
+
     def __init__(
         self,
         workspace_dir: Optional[str] = None,
@@ -45,36 +79,49 @@ class CodeExecutor:
         max_memory_mb: int = 1024,
         allowed_imports: Optional[List[str]] = None,
         blocked_imports: Optional[List[str]] = None,
-        auto_install_packages: bool = True
+        auto_install_packages: bool = True,
+        security_level: str = 'moderate',
+        accumulate_blocks: bool = True,
+        encoding: str = 'utf-8'
     ):
         """
         Initialize code executor.
-        
+
         Args:
             workspace_dir: Directory for code execution (created if doesn't exist)
             timeout: Maximum execution time in seconds
             max_memory_mb: Maximum memory usage in MB
-            allowed_imports: Whitelist of allowed imports (None = allow all)
-            blocked_imports: Blacklist of blocked imports
+            allowed_imports: Whitelist of allowed imports (None = allow all safe imports)
+            blocked_imports: Blacklist of blocked imports (overrides security_level)
             auto_install_packages: Auto-install missing packages
+            security_level: 'strict', 'moderate', or 'permissive' (default: 'moderate')
+            accumulate_blocks: Execute blocks with accumulated context (default: True)
+            encoding: File encoding for code files (default: 'utf-8')
         """
         self.workspace_dir = str(Path(workspace_dir).resolve()) if workspace_dir else tempfile.mkdtemp(prefix="code_exec_")
         self.timeout = timeout
         self.max_memory_mb = max_memory_mb
-        self.allowed_imports = allowed_imports
-        self.blocked_imports = blocked_imports or [
-            'os.system', 'subprocess', 'eval', 'exec', 'compile',
-            '__import__', 'open'  # We'll provide safe alternatives
-        ]
         self.auto_install_packages = auto_install_packages
-        
+        self.security_level = security_level
+        self.accumulate_blocks = accumulate_blocks
+        self.encoding = encoding
+
+        # Set up security based on level
+        security_config = SECURITY_LEVELS.get(security_level, SECURITY_LEVELS['moderate'])
+        self.blocked_imports = blocked_imports if blocked_imports is not None else security_config['blocked_imports']
+        self.blocked_patterns = security_config['blocked_patterns']
+        self.allowed_imports = allowed_imports if allowed_imports is not None else DEFAULT_SAFE_IMPORTS
+
         # Create workspace
         Path(self.workspace_dir).mkdir(parents=True, exist_ok=True)
-        
-        # Track installed packages
+
+        # Track installed packages and accumulated code
         self.installed_packages = set()
-        
+        self.accumulated_code = []
+        self.accumulated_imports = set()
+
         logger.info(f"Code executor initialized with workspace: {self.workspace_dir}")
+        logger.info(f"Security level: {security_level}, Accumulate blocks: {accumulate_blocks}")
     
     def extract_code_blocks(self, text: str) -> List[Dict[str, str]]:
         """
@@ -117,41 +164,86 @@ class CodeExecutor:
     def check_imports(self, code: str) -> Tuple[bool, List[str]]:
         """
         Check if code contains only allowed imports.
-        
+
         Returns:
             (is_safe, list_of_issues)
         """
         issues = []
-        
+
         # Extract import statements
         import_pattern = r'^\s*(?:import|from)\s+(\S+)'
         imports = re.findall(import_pattern, code, re.MULTILINE)
-        
+
         # Check against blocked imports
         for imp in imports:
             base_module = imp.split('.')[0]
-            
-            if self.allowed_imports and base_module not in self.allowed_imports:
-                issues.append(f"Import '{imp}' not in whitelist")
-            
+
+            # Check blocked imports
             if any(blocked in imp for blocked in self.blocked_imports):
                 issues.append(f"Blocked import detected: '{imp}'")
-        
-        # Check for dangerous built-ins
-        dangerous_patterns = [
-            r'\beval\s*\(',
-            r'\bexec\s*\(',
-            r'\bcompile\s*\(',
-            r'\b__import__\s*\(',
-            r'os\.system\s*\(',
-            r'subprocess\.',
-        ]
-        
-        for pattern in dangerous_patterns:
+
+        # Check for dangerous patterns based on security level
+        for pattern in self.blocked_patterns:
             if re.search(pattern, code):
                 issues.append(f"Dangerous pattern detected: {pattern}")
-        
+
         return len(issues) == 0, issues
+
+    def sanitize_code(self, code: str) -> str:
+        """
+        Sanitize code by removing problematic characters for cross-platform compatibility.
+
+        Args:
+            code: Raw code string
+
+        Returns:
+            Sanitized code string safe for file writing
+        """
+        # Replace problematic Unicode characters with ASCII equivalents
+        replacements = {
+            '\u2713': '[OK]',      # Check mark
+            '\u2714': '[OK]',      # Heavy check mark
+            '\u2715': '[X]',       # X mark
+            '\u2716': '[X]',       # Heavy X mark
+            '\u2717': '[X]',       # Ballot X
+            '\u2718': '[X]',       # Heavy ballot X
+            '\U0001f4ca': '[CHART]',  # Bar chart emoji
+            '\U0001f4c8': '[CHART]',  # Chart with upwards trend
+            '\U0001f4c9': '[CHART]',  # Chart with downwards trend
+            '\U0001f4c4': '[DOC]',    # Page facing up
+            '\U0001f4dd': '[NOTE]',   # Memo
+            '\u2022': '*',         # Bullet point
+            '\u2023': '>',         # Triangular bullet
+            '\u2043': '-',         # Hyphen bullet
+            '\u25aa': '*',         # Black small square
+            '\u25ab': '*',         # White small square
+            '\u25cf': '*',         # Black circle
+            '\u25cb': 'o',         # White circle
+            '\u2192': '->',        # Right arrow
+            '\u2190': '<-',        # Left arrow
+            '\u2191': '^',         # Up arrow
+            '\u2193': 'v',         # Down arrow
+            '\u2026': '...',       # Ellipsis
+            '\u201c': '"',         # Left double quotation
+            '\u201d': '"',         # Right double quotation
+            '\u2018': "'",         # Left single quotation
+            '\u2019': "'",         # Right single quotation
+            '\u2014': '--',        # Em dash
+            '\u2013': '-',         # En dash
+        }
+
+        for char, replacement in replacements.items():
+            code = code.replace(char, replacement)
+
+        # Remove any remaining non-ASCII characters that could cause issues
+        # but preserve common safe ones
+        try:
+            code.encode('utf-8')
+        except UnicodeEncodeError:
+            # Fallback: encode with replacement
+            code = code.encode('utf-8', errors='replace').decode('utf-8')
+
+        return code
     
     def extract_required_packages(self, code: str) -> List[str]:
         """
@@ -255,16 +347,18 @@ class CodeExecutor:
         self,
         code: str,
         check_safety: bool = True,
-        auto_install: bool = True
+        auto_install: bool = True,
+        use_accumulated: bool = False
     ) -> Dict[str, Any]:
         """
         Execute Python code with safety checks and output capture.
-        
+
         Args:
             code: Python code to execute
             check_safety: Whether to perform safety checks
             auto_install: Whether to auto-install packages
-            
+            use_accumulated: Whether to prepend accumulated code from previous executions
+
         Returns:
             Dict with keys: success, output, error, files, execution_time
         """
@@ -277,102 +371,215 @@ class CodeExecutor:
             'execution_time': 0,
             'workspace': self.workspace_dir
         }
-        
+
+        # Sanitize code to handle Unicode characters
+        code = self.sanitize_code(code)
+
         # Safety checks
         if check_safety:
             is_safe, issues = self.check_imports(code)
             if not is_safe:
                 result['error'] = "Safety check failed:\n" + "\n".join(issues)
                 return result
-        
+
         # Install dependencies
         if auto_install:
             success, msg = self.prepare_execution_environment(code)
             if not success:
                 result['error'] = f"Environment preparation failed: {msg}"
                 return result
-        
+
+        # Build execution code (potentially with accumulated context)
+        execution_code = code
+        if use_accumulated and self.accumulated_code:
+            # Combine accumulated imports and code with current code
+            execution_code = self._build_accumulated_code(code)
+
         # Create a temporary Python file
         code_file = Path(self.workspace_dir).resolve() / "execution_script.py"
-        
+
         try:
-            # Write code to file
-            with open(code_file, 'w') as f:
-                f.write(code)
-            
-            # Set up timeout
-            if hasattr(signal, 'SIGALRM'):
+            # Write code to file with explicit UTF-8 encoding
+            with open(code_file, 'w', encoding=self.encoding, errors='replace') as f:
+                f.write(execution_code)
+
+            # Set up timeout (Unix-only, skip on Windows)
+            use_alarm = hasattr(signal, 'SIGALRM') and os.name != 'nt'
+            if use_alarm:
                 signal.signal(signal.SIGALRM, timeout_handler)
                 signal.alarm(self.timeout)
-            
+
             # Execute code in subprocess for better isolation
+            env = os.environ.copy()
+            env['PYTHONIOENCODING'] = 'utf-8'
+
             process = subprocess.Popen(
                 [sys.executable, str(code_file)],
                 cwd=str(Path(self.workspace_dir).resolve()),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                env=env
             )
-            
+
             try:
                 stdout, stderr = process.communicate(timeout=self.timeout)
-                
+
                 result['output'] = stdout
                 if stderr:
-                    result['error'] = stderr
-                
+                    # Filter out common warnings that aren't errors
+                    if process.returncode == 0:
+                        result['warnings'] = stderr
+                    else:
+                        result['error'] = stderr
+
                 result['success'] = process.returncode == 0
-                
+
+                # If successful and accumulating, store the code
+                if result['success'] and self.accumulate_blocks:
+                    self._accumulate_code(code)
+
             except subprocess.TimeoutExpired:
                 process.kill()
                 result['error'] = f"Execution timed out after {self.timeout} seconds"
-            
+
             finally:
-                if hasattr(signal, 'SIGALRM'):
+                if use_alarm:
                     signal.alarm(0)  # Cancel alarm
-            
+
             # List generated files
             result['files'] = self.list_generated_files()
-            
+
         except Exception as e:
             result['error'] = f"Execution error: {str(e)}\n{traceback.format_exc()}"
-        
+
         finally:
             result['execution_time'] = time.time() - start_time
-            
+
             # Cleanup code file
             if code_file.exists():
-                code_file.unlink()
-        
+                try:
+                    code_file.unlink()
+                except Exception:
+                    pass
+
         return result
+
+    def _extract_imports(self, code: str) -> List[str]:
+        """Extract import statements from code."""
+        import_lines = []
+        for line in code.split('\n'):
+            stripped = line.strip()
+            if stripped.startswith('import ') or stripped.startswith('from '):
+                import_lines.append(stripped)
+        return import_lines
+
+    def _accumulate_code(self, code: str):
+        """Store code for potential reuse in subsequent blocks."""
+        # Extract and store imports
+        imports = self._extract_imports(code)
+        for imp in imports:
+            self.accumulated_imports.add(imp)
+
+        # Store non-import code (functions, classes, variables)
+        non_import_lines = []
+        for line in code.split('\n'):
+            stripped = line.strip()
+            if not (stripped.startswith('import ') or stripped.startswith('from ')):
+                non_import_lines.append(line)
+
+        # Only store definitions (functions, classes, variables)
+        code_to_store = '\n'.join(non_import_lines).strip()
+        if code_to_store:
+            self.accumulated_code.append(code_to_store)
+
+    def _build_accumulated_code(self, new_code: str) -> str:
+        """Build code with accumulated context."""
+        parts = []
+
+        # Add accumulated imports
+        new_imports = self._extract_imports(new_code)
+        all_imports = self.accumulated_imports.union(set(new_imports))
+        if all_imports:
+            parts.append('\n'.join(sorted(all_imports)))
+            parts.append('')
+
+        # Add accumulated code (definitions)
+        if self.accumulated_code:
+            parts.append('# --- Accumulated context ---')
+            parts.extend(self.accumulated_code)
+            parts.append('# --- End accumulated context ---\n')
+
+        # Add new code (without its imports, as they're already included)
+        new_lines = []
+        for line in new_code.split('\n'):
+            stripped = line.strip()
+            if not (stripped.startswith('import ') or stripped.startswith('from ')):
+                new_lines.append(line)
+        parts.append('\n'.join(new_lines))
+
+        return '\n'.join(parts)
+
+    def reset_accumulated(self):
+        """Reset accumulated code context."""
+        self.accumulated_code = []
+        self.accumulated_imports = set()
+        logger.info("Accumulated code context reset")
     
     def execute_code_blocks(
         self,
         text: str,
-        check_safety: bool = True
+        check_safety: bool = True,
+        stop_on_error: bool = False,
+        use_accumulated: bool = None
     ) -> List[Dict[str, Any]]:
         """
         Extract and execute all Python code blocks from text.
-        
+
         Args:
             text: Text containing code blocks
             check_safety: Whether to perform safety checks
-            
+            stop_on_error: Stop execution if a block fails
+            use_accumulated: Use accumulated context (defaults to self.accumulate_blocks)
+
         Returns:
             List of execution results
         """
         code_blocks = self.extract_python_blocks(text)
         results = []
-        
+
+        # Reset accumulated context for fresh execution
+        if self.accumulate_blocks:
+            self.reset_accumulated()
+
+        use_acc = use_accumulated if use_accumulated is not None else self.accumulate_blocks
+
         for i, code in enumerate(code_blocks, 1):
             logger.info(f"Executing code block {i}/{len(code_blocks)}")
-            result = self.execute_python_code(code, check_safety=check_safety)
+
+            # Use accumulated context for blocks after the first
+            should_accumulate = use_acc and i > 1
+            result = self.execute_python_code(
+                code,
+                check_safety=check_safety,
+                use_accumulated=should_accumulate
+            )
             result['block_number'] = i
+            result['code'] = code
             results.append(result)
-            
+
             if not result['success']:
                 logger.warning(f"Block {i} failed: {result['error']}")
-        
+                if stop_on_error:
+                    logger.info("Stopping execution due to error")
+                    break
+
+        # Summary
+        successful = sum(1 for r in results if r['success'])
+        logger.info(f"Execution complete: {successful}/{len(results)} successful")
+
         return results
     
     def list_generated_files(self) -> List[str]:
